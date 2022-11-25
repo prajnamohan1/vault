@@ -58,7 +58,7 @@ jobs:
       - name: Build UI
         run: make crt-build-ui
       - name: Build Vault
-        uses: hashicorp/actions-go-build@v0.1.7
+        uses: hashicorp/actions-go-build@cache-go-dependencies
         env:
           BASE_VERSION: ${{ inputs.vault-base-version }}
           PRERELEASE_VERSION: ${{ inputs.vault-prerelease-version }}
