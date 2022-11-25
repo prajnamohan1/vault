@@ -14,7 +14,7 @@ on:
     branches:
       - main
       - release/**
-      - testing-set-product-version
+      - test-go-dep-cache-with-action
 
 env:
   PKG_NAME: vault
