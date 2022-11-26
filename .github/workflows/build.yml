@@ -78,6 +78,7 @@ jobs:
     - uses: actions/upload-artifact@v3
       with:
         name: ui.zip
+        path: ui.zip
         retention-days: 1
 
   build-other:
