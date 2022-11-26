@@ -61,7 +61,7 @@ jobs:
           if-no-files-found: error
 
   build-ui:
-    runs-on: ubuntu-latest
+    runs-on: [custom, linux, xl]
     steps:
     - uses: actions/checkout@v3
     - name: Set up node and yarn

@@ -42,7 +42,7 @@ on:
         required: true
 jobs:
   build:
-    runs-on: "ubuntu-latest"
+    runs-on: [custom, linux, xl]
     name: Vault ${{ inputs.goos }} ${{ inputs.goarch }} v${{ inputs.vault-version }}
     steps:
       - uses: actions/checkout@v3
