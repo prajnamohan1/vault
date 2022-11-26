@@ -60,11 +60,30 @@ jobs:
           path: ${{ steps.generate-metadata-file.outputs.filepath }}
           if-no-files-found: error
 
+  build-ui:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Set up node and yarn
+      uses: actions/setup-node@v3
+      with:
+        node-version: 14
+        cache: yarn
+        cache-dependency-path: ui/yarn.lock
+    - name: Build Vault UI
+      run: make crt-build-ui
+    - uses: actions/upload-artifact@v3
+      with:
+        name: ui
+        path: ui/ # or path/to/artifact
+        retention-days: 1
+
   build-other:
      name: Build Vault Other
      needs:
        - set-product-version
        - product-metadata
+       - build-ui
      strategy:
        matrix:
          goos: [freebsd, windows, netbsd, openbsd, solaris]
@@ -95,6 +114,7 @@ jobs:
     needs:
       - set-product-version
       - product-metadata
+      - build-ui
     strategy:
       matrix:
         goos: [linux]
@@ -117,6 +137,7 @@ jobs:
      needs:
      - set-product-version
      - product-metadata
+     - build-ui
      strategy:
        matrix:
          goos: [darwin]

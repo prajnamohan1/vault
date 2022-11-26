@@ -46,14 +46,15 @@ jobs:
     name: Vault ${{ inputs.goos }} ${{ inputs.goarch }} v${{ inputs.vault-version }}
     steps:
       - uses: actions/checkout@v3
-      - name: Set up node and yarn
-        uses: actions/setup-node@v3
+      - uses: actions/download-artifact@v3
         with:
-          node-version: 14
-          cache: yarn
-          cache-dependency-path: ui/yarn.lock
-      - name: Build UI
-        run: make crt-build-ui
+          name: ui
+          path: ui
+      - name: Display structure of downloaded files
+        run: ls -R
+      - name: Display structure of downloaded files
+        run: ls -R
+        working-directory: ui
       - name: Build Vault
         uses: hashicorp/actions-go-build@cache-go-dependencies
         env:
