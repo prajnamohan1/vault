@@ -33,7 +33,7 @@ env:
 jobs:
   # Read Enos scenario matrix file based on artifact-name input to test
   read-enos-matrix:
-    runs-on: ubuntu-latest
+    runs-on: [custom, linux, xl]
     outputs:
       enos-scenarios: ${{ steps.enos-matrix.outputs.matrix }}
     steps:
