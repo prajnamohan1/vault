@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false # don't fail as that can skip required cleanup steps for jobs
       matrix: ${{ fromJson(needs.read-enos-matrix.outputs.enos-scenarios) }}
-    runs-on: ubuntu-latest
+    runs-on: [custom, linux, xl]
     env:
       GITHUB_TOKEN: ${{ secrets.ELEVATED_GITHUB_TOKEN }}
     steps:
