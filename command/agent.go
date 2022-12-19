@@ -16,7 +16,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/go-multierror"
+	"github.com/hashicorp/go-secure-stdlib/reloadutil"
 	"github.com/hashicorp/vault/command/agent/sink/inmem"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 
 	systemd "github.com/coreos/go-systemd/daemon"
 	log "github.com/hashicorp/go-hclog"
@@ -75,6 +79,20 @@ type AgentCommand struct {
 
 	ShutdownCh chan struct{}
 	SighupCh   chan struct{}
+	startedCh  chan (struct{}) // for tests
+
+	// Lock and reload functions for stanza/types
+	reloadFuncsLock *sync.RWMutex
+	reloadFuncs     *map[string][]reloadutil.ReloadFunc
+
+	// TODO: PW: Group these nicely...
+	flagSets    *FlagSets
+	agentConfig *agentConfig.Config
+	// sinks       []*sink.SinkConfig
+	serverInfo *serverInformation
+	listeners  []net.Listener
+
+	// ....TODO: PW: add others..
 
 	logWriter io.Writer
 	logGate   *gatedwriter.Writer
@@ -85,11 +103,19 @@ type AgentCommand struct {
 
 	cleanupGuard sync.Once
 
-	startedCh chan (struct{}) // for tests
-
 	flagConfigs        []string
 	flagExitAfterAuth  bool
 	flagTestVerifyOnly bool
+}
+
+type serverInformation struct {
+	entries map[string]string
+}
+
+func NewServerInformation() *serverInformation {
+	return &serverInformation{
+		make(map[string]string),
+	}
 }
 
 func (c *AgentCommand) Synopsis() string {
@@ -169,129 +195,62 @@ func (c *AgentCommand) AutocompleteFlags() complete.Flags {
 }
 
 func (c *AgentCommand) Run(args []string) int {
-	f := c.Flags()
+	var err error
 
-	if err := f.Parse(args); err != nil {
+	if err := c.handleFlagSetsSetup(args); err != nil {
 		c.UI.Error(err.Error())
 		return 1
 	}
 
-	// Create a logger. We wrap it in a gated writer so that it doesn't
-	// start logging too early.
-	c.logGate = gatedwriter.NewWriter(os.Stderr)
-	c.logWriter = c.logGate
-
-	if c.logFlags.flagCombineLogs {
-		c.logWriter = os.Stdout
-	}
-
-	// Validation
+	// Config flag validation
 	if len(c.flagConfigs) != 1 {
 		c.UI.Error("Must specify exactly one config path using -config")
 		return 1
 	}
 
 	// Load the configuration file
-	config, err := agentConfig.LoadConfig(c.flagConfigs[0])
+	c.agentConfig, err = agentConfig.LoadConfig(c.flagConfigs[0])
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error loading configuration from %s: %s", c.flagConfigs[0], err))
 		return 1
 	}
 
 	// Ensure at least one config was found.
-	if config == nil {
-		c.UI.Output(wrapAtLength(
-			"No configuration read. Please provide the configuration with the " +
-				"-config flag."))
+	if c.agentConfig == nil {
+		c.UI.Output(wrapAtLength("No configuration read. Please provide the configuration with the -config flag."))
 		return 1
 	}
 
-	if config.AutoAuth == nil && config.Cache == nil {
+	// TODO: Can this be moved somewhere? odd check.. one error and a warning
+	if c.agentConfig.AutoAuth == nil && c.agentConfig.Cache == nil {
 		c.UI.Error("No auto_auth or cache block found in config file")
 		return 1
 	}
-	if config.AutoAuth == nil {
+	if c.agentConfig.AutoAuth == nil {
 		c.UI.Info("No auto_auth block found in config file, not starting automatic authentication feature")
 	}
 
-	c.updateConfig(f, config)
+	// TODO: PW: Update the config for flags, env vars, config file..
+	// Does this actually need the flags? are we re-doing stuff?
+	c.updateConfig()
 
-	// Parse all the log related config
-	logLevel, err := logging.ParseLogLevel(config.LogLevel)
-	if err != nil {
-		c.UI.Error(err.Error())
-		return 1
-	}
-
-	logFormat, err := logging.ParseLogFormat(config.LogFormat)
-	if err != nil {
-		c.UI.Error(err.Error())
-		return 1
-	}
-
-	logRotateDuration, err := parseutil.ParseDurationSecond(config.LogRotateDuration)
-	if err != nil {
-		c.UI.Error(err.Error())
-		return 1
-	}
-
-	logRotateBytes, err := parseutil.ParseInt(config.LogRotateBytes)
-	if err != nil {
-		c.UI.Error(err.Error())
-		return 1
-	}
-
-	logRotateMaxFiles, err := parseutil.ParseInt(config.LogRotateMaxFiles)
-	if err != nil {
-		c.UI.Error(err.Error())
-		return 1
-	}
-
-	logCfg := &logging.LogConfig{
-		Name:              "vault-agent",
-		LogLevel:          logLevel,
-		LogFormat:         logFormat,
-		LogFilePath:       config.LogFile,
-		LogRotateDuration: logRotateDuration,
-		LogRotateBytes:    int(logRotateBytes),
-		LogRotateMaxFiles: int(logRotateMaxFiles),
-	}
-
-	l, err := logging.Setup(logCfg, c.logWriter)
-	if err != nil {
-		c.UI.Error(err.Error())
-		return 1
-	}
-
-	c.logger = l
-
-	infoKeys := make([]string, 0, 10)
-	info := make(map[string]string)
-	info["log level"] = config.LogLevel
-	infoKeys = append(infoKeys, "log level")
-
-	infoKeys = append(infoKeys, "version")
-	verInfo := version.GetVersion()
-	info["version"] = verInfo.FullVersionNumber(false)
-	if verInfo.Revision != "" {
-		info["version sha"] = strings.Trim(verInfo.Revision, "'")
-		infoKeys = append(infoKeys, "version sha")
-	}
-	infoKeys = append(infoKeys, "cgo")
-	info["cgo"] = "disabled"
-	if version.CgoEnabled {
-		info["cgo"] = "enabled"
-	}
-
-	// Tests might not want to start a vault server and just want to verify
-	// the configuration.
+	// Tests might not want to start a vault server and just want to verify the configuration.
 	if c.flagTestVerifyOnly {
 		if os.Getenv("VAULT_TEST_VERIFY_ONLY_DUMP_CONFIG") != "" {
-			c.UI.Output(fmt.Sprintf(
-				"\nConfiguration:\n%s\n",
-				pretty.Sprint(*config)))
+			c.UI.Output(fmt.Sprintf("\nConfiguration:\n%s\n", pretty.Sprint(*c.agentConfig)))
 		}
 		return 0
+	}
+
+	// Logging setup
+	if err := c.handleLogSetup(); err != nil {
+		c.UI.Error(flattenErrors(err).Error())
+		return 1
+	}
+
+	if err := c.handleServerInfoSetup(); err != nil {
+		c.UI.Error(err.Error())
+		return 1
 	}
 
 	// Ignore any setting of agent's address. This client is used by the agent
@@ -299,9 +258,7 @@ func (c *AgentCommand) Run(args []string) int {
 	c.flagAgentAddress = ""
 	client, err := c.Client()
 	if err != nil {
-		c.UI.Error(fmt.Sprintf(
-			"Error fetching client: %v",
-			err))
+		c.UI.Error(fmt.Sprintf("Error fetching client: %v", err))
 		return 1
 	}
 
@@ -313,12 +270,12 @@ func (c *AgentCommand) Run(args []string) int {
 
 	// telemetry configuration
 	inmemMetrics, _, prometheusEnabled, err := configutil.SetupTelemetry(&configutil.SetupTelemetryOpts{
-		Config:      config.Telemetry,
+		Config:      c.agentConfig.Telemetry,
 		Ui:          c.UI,
 		ServiceName: "vault",
 		DisplayName: "Vault",
 		UserAgent:   useragent.String(),
-		ClusterName: config.ClusterName,
+		ClusterName: c.agentConfig.ClusterName,
 	})
 	if err != nil {
 		c.UI.Error(fmt.Sprintf("Error initializing telemetry: %s", err))
@@ -329,9 +286,9 @@ func (c *AgentCommand) Run(args []string) int {
 	var method auth.AuthMethod
 	var sinks []*sink.SinkConfig
 	var templateNamespace string
-	if config.AutoAuth != nil {
-		if client.Headers().Get(consts.NamespaceHeaderName) == "" && config.AutoAuth.Method.Namespace != "" {
-			client.SetNamespace(config.AutoAuth.Method.Namespace)
+	if c.agentConfig.AutoAuth != nil {
+		if client.Headers().Get(consts.NamespaceHeaderName) == "" && c.agentConfig.AutoAuth.Method.Namespace != "" {
+			client.SetNamespace(c.agentConfig.AutoAuth.Method.Namespace)
 		}
 		templateNamespace = client.Headers().Get(consts.NamespaceHeaderName)
 
@@ -341,15 +298,15 @@ func (c *AgentCommand) Run(args []string) int {
 			return 1
 		}
 
-		if config.DisableIdleConnsAutoAuth {
+		if c.agentConfig.DisableIdleConnsAutoAuth {
 			sinkClient.SetMaxIdleConnections(-1)
 		}
 
-		if config.DisableKeepAlivesAutoAuth {
+		if c.agentConfig.DisableKeepAlivesAutoAuth {
 			sinkClient.SetDisableKeepAlives(true)
 		}
 
-		for _, sc := range config.AutoAuth.Sinks {
+		for _, sc := range c.agentConfig.AutoAuth.Sinks {
 			switch sc.Type {
 			case "file":
 				config := &sink.SinkConfig{
@@ -376,11 +333,11 @@ func (c *AgentCommand) Run(args []string) int {
 		}
 
 		authConfig := &auth.AuthConfig{
-			Logger:    c.logger.Named(fmt.Sprintf("auth.%s", config.AutoAuth.Method.Type)),
-			MountPath: config.AutoAuth.Method.MountPath,
-			Config:    config.AutoAuth.Method.Config,
+			Logger:    c.logger.Named(fmt.Sprintf("auth.%s", c.agentConfig.AutoAuth.Method.Type)),
+			MountPath: c.agentConfig.AutoAuth.Method.MountPath,
+			Config:    c.agentConfig.AutoAuth.Method.Config,
 		}
-		switch config.AutoAuth.Method.Type {
+		switch c.agentConfig.AutoAuth.Method.Type {
 		case "alicloud":
 			method, err = alicloud.NewAliCloudAuthMethod(authConfig)
 		case "aws":
@@ -404,11 +361,11 @@ func (c *AgentCommand) Run(args []string) int {
 		case "pcf": // Deprecated.
 			method, err = cf.NewCFAuthMethod(authConfig)
 		default:
-			c.UI.Error(fmt.Sprintf("Unknown auth method %q", config.AutoAuth.Method.Type))
+			c.UI.Error(fmt.Sprintf("Unknown auth method %q", c.agentConfig.AutoAuth.Method.Type))
 			return 1
 		}
 		if err != nil {
-			c.UI.Error(fmt.Errorf("Error creating %s auth method: %w", config.AutoAuth.Method.Type, err).Error())
+			c.UI.Error(fmt.Errorf("Error creating %s auth method: %w", c.agentConfig.AutoAuth.Method.Type, err).Error())
 			return 1
 		}
 	}
@@ -417,35 +374,35 @@ func (c *AgentCommand) Run(args []string) int {
 	// confuse the issue of retries for auth failures which have their own
 	// config and are handled a bit differently.
 	if os.Getenv(api.EnvVaultMaxRetries) == "" {
-		client.SetMaxRetries(config.Vault.Retry.NumRetries)
+		client.SetMaxRetries(c.agentConfig.Vault.Retry.NumRetries)
 	}
 
 	enforceConsistency := cache.EnforceConsistencyNever
 	whenInconsistent := cache.WhenInconsistentFail
-	if config.APIProxy != nil {
-		switch config.APIProxy.EnforceConsistency {
+	if c.agentConfig.APIProxy != nil {
+		switch c.agentConfig.APIProxy.EnforceConsistency {
 		case "always":
 			enforceConsistency = cache.EnforceConsistencyAlways
 		case "never", "":
 		default:
-			c.UI.Error(fmt.Sprintf("Unknown api_proxy setting for enforce_consistency: %q", config.APIProxy.EnforceConsistency))
+			c.UI.Error(fmt.Sprintf("Unknown api_proxy setting for enforce_consistency: %q", c.agentConfig.APIProxy.EnforceConsistency))
 			return 1
 		}
 
-		switch config.APIProxy.WhenInconsistent {
+		switch c.agentConfig.APIProxy.WhenInconsistent {
 		case "retry":
 			whenInconsistent = cache.WhenInconsistentRetry
 		case "forward":
 			whenInconsistent = cache.WhenInconsistentForward
 		case "fail", "":
 		default:
-			c.UI.Error(fmt.Sprintf("Unknown api_proxy setting for when_inconsistent: %q", config.APIProxy.WhenInconsistent))
+			c.UI.Error(fmt.Sprintf("Unknown api_proxy setting for when_inconsistent: %q", c.agentConfig.APIProxy.WhenInconsistent))
 			return 1
 		}
 	}
 	// Keep Cache configuration for legacy reasons, but error if defined alongside API Proxy
-	if config.Cache != nil {
-		switch config.Cache.EnforceConsistency {
+	if c.agentConfig.Cache != nil {
+		switch c.agentConfig.Cache.EnforceConsistency {
 		case "always":
 			if enforceConsistency != cache.EnforceConsistencyNever {
 				c.UI.Error("enforce_consistency configured in both api_proxy and cache blocks. Please remove this configuration from the cache block.")
@@ -455,11 +412,11 @@ func (c *AgentCommand) Run(args []string) int {
 			}
 		case "never", "":
 		default:
-			c.UI.Error(fmt.Sprintf("Unknown cache setting for enforce_consistency: %q", config.Cache.EnforceConsistency))
+			c.UI.Error(fmt.Sprintf("Unknown cache setting for enforce_consistency: %q", c.agentConfig.Cache.EnforceConsistency))
 			return 1
 		}
 
-		switch config.Cache.WhenInconsistent {
+		switch c.agentConfig.Cache.WhenInconsistent {
 		case "retry":
 			if whenInconsistent != cache.WhenInconsistentFail {
 				c.UI.Error("when_inconsistent configured in both api_proxy and cache blocks. Please remove this configuration from the cache block.")
@@ -476,16 +433,16 @@ func (c *AgentCommand) Run(args []string) int {
 			}
 		case "fail", "":
 		default:
-			c.UI.Error(fmt.Sprintf("Unknown cache setting for when_inconsistent: %q", config.Cache.WhenInconsistent))
+			c.UI.Error(fmt.Sprintf("Unknown cache setting for when_inconsistent: %q", c.agentConfig.Cache.WhenInconsistent))
 			return 1
 		}
 	}
 
 	// Warn if cache _and_ cert auto-auth is enabled but certificates were not
 	// provided in the auto_auth.method["cert"].config stanza.
-	if config.Cache != nil && (config.AutoAuth != nil && config.AutoAuth.Method != nil && config.AutoAuth.Method.Type == "cert") {
-		_, okCertFile := config.AutoAuth.Method.Config["client_cert"]
-		_, okCertKey := config.AutoAuth.Method.Config["client_key"]
+	if c.agentConfig.Cache != nil && (c.agentConfig.AutoAuth != nil && c.agentConfig.AutoAuth.Method != nil && c.agentConfig.AutoAuth.Method.Type == "cert") {
+		_, okCertFile := c.agentConfig.AutoAuth.Method.Config["client_cert"]
+		_, okCertKey := c.agentConfig.AutoAuth.Method.Config["client_key"]
 
 		// If neither of these exists in the cert stanza, agent will use the
 		// certs from the vault stanza.
@@ -511,11 +468,11 @@ func (c *AgentCommand) Run(args []string) int {
 		return 1
 	}
 
-	if config.DisableIdleConnsAPIProxy {
+	if c.agentConfig.DisableIdleConnsAPIProxy {
 		proxyClient.SetMaxIdleConnections(-1)
 	}
 
-	if config.DisableKeepAlivesAPIProxy {
+	if c.agentConfig.DisableKeepAlivesAPIProxy {
 		proxyClient.SetDisableKeepAlives(true)
 	}
 
@@ -534,7 +491,7 @@ func (c *AgentCommand) Run(args []string) int {
 	}
 
 	// Parse agent cache configurations
-	if config.Cache != nil {
+	if c.agentConfig.Cache != nil {
 		cacheLogger := c.logger.Named("cache")
 
 		// Create the lease cache proxier and set its underlying proxier to
@@ -551,36 +508,36 @@ func (c *AgentCommand) Run(args []string) int {
 		}
 
 		// Configure persistent storage and add to LeaseCache
-		if config.Cache.Persist != nil {
-			if config.Cache.Persist.Path == "" {
+		if c.agentConfig.Cache.Persist != nil {
+			if c.agentConfig.Cache.Persist.Path == "" {
 				c.UI.Error("must specify persistent cache path")
 				return 1
 			}
 
 			// Set AAD based on key protection type
 			var aad string
-			switch config.Cache.Persist.Type {
+			switch c.agentConfig.Cache.Persist.Type {
 			case "kubernetes":
-				aad, err = getServiceAccountJWT(config.Cache.Persist.ServiceAccountTokenFile)
+				aad, err = getServiceAccountJWT(c.agentConfig.Cache.Persist.ServiceAccountTokenFile)
 				if err != nil {
-					c.UI.Error(fmt.Sprintf("failed to read service account token from %s: %s", config.Cache.Persist.ServiceAccountTokenFile, err))
+					c.UI.Error(fmt.Sprintf("failed to read service account token from %s: %s", c.agentConfig.Cache.Persist.ServiceAccountTokenFile, err))
 					return 1
 				}
 			default:
-				c.UI.Error(fmt.Sprintf("persistent key protection type %q not supported", config.Cache.Persist.Type))
+				c.UI.Error(fmt.Sprintf("persistent key protection type %q not supported", c.agentConfig.Cache.Persist.Type))
 				return 1
 			}
 
 			// Check if bolt file exists already
-			dbFileExists, err := cacheboltdb.DBFileExists(config.Cache.Persist.Path)
+			dbFileExists, err := cacheboltdb.DBFileExists(c.agentConfig.Cache.Persist.Path)
 			if err != nil {
-				c.UI.Error(fmt.Sprintf("failed to check if bolt file exists at path %s: %s", config.Cache.Persist.Path, err))
+				c.UI.Error(fmt.Sprintf("failed to check if bolt file exists at path %s: %s", c.agentConfig.Cache.Persist.Path, err))
 				return 1
 			}
 			if dbFileExists {
 				// Open the bolt file, but wait to setup Encryption
 				ps, err := cacheboltdb.NewBoltStorage(&cacheboltdb.BoltStorageConfig{
-					Path:   config.Cache.Persist.Path,
+					Path:   c.agentConfig.Cache.Persist.Path,
 					Logger: cacheLogger.Named("cacheboltdb"),
 				})
 				if err != nil {
@@ -607,7 +564,7 @@ func (c *AgentCommand) Run(args []string) int {
 
 				// Open the bolt file with the wrapper provided
 				ps, err = cacheboltdb.NewBoltStorage(&cacheboltdb.BoltStorageConfig{
-					Path:    config.Cache.Persist.Path,
+					Path:    c.agentConfig.Cache.Persist.Path,
 					Logger:  cacheLogger.Named("cacheboltdb"),
 					Wrapper: km.Wrapper(),
 					AAD:     aad,
@@ -620,7 +577,7 @@ func (c *AgentCommand) Run(args []string) int {
 				// Restore anything in the persistent cache to the memory cache
 				if err := leaseCache.Restore(ctx, ps); err != nil {
 					c.UI.Error(fmt.Sprintf("Error restoring in-memory cache from persisted file: %v", err))
-					if config.Cache.Persist.ExitOnErr {
+					if c.agentConfig.Cache.Persist.ExitOnErr {
 						return 1
 					}
 				}
@@ -630,7 +587,7 @@ func (c *AgentCommand) Run(args []string) int {
 				oldTokenBytes, err := ps.GetAutoAuthToken(ctx)
 				if err != nil {
 					c.UI.Error(fmt.Sprintf("Error in fetching previous auto-auth token: %s", err))
-					if config.Cache.Persist.ExitOnErr {
+					if c.agentConfig.Cache.Persist.ExitOnErr {
 						return 1
 					}
 				}
@@ -638,7 +595,7 @@ func (c *AgentCommand) Run(args []string) int {
 					oldToken, err := cachememdb.Deserialize(oldTokenBytes)
 					if err != nil {
 						c.UI.Error(fmt.Sprintf("Error in deserializing previous auto-auth token cache entry: %s", err))
-						if config.Cache.Persist.ExitOnErr {
+						if c.agentConfig.Cache.Persist.ExitOnErr {
 							return 1
 						}
 					}
@@ -647,17 +604,17 @@ func (c *AgentCommand) Run(args []string) int {
 
 				// If keep_after_import true, set persistent storage layer in
 				// leaseCache, else remove db file
-				if config.Cache.Persist.KeepAfterImport {
+				if c.agentConfig.Cache.Persist.KeepAfterImport {
 					defer ps.Close()
 					leaseCache.SetPersistentStorage(ps)
 				} else {
 					if err := ps.Close(); err != nil {
 						c.UI.Warn(fmt.Sprintf("failed to close persistent cache file: %s", err))
 					}
-					dbFile := filepath.Join(config.Cache.Persist.Path, cacheboltdb.DatabaseFileName)
+					dbFile := filepath.Join(c.agentConfig.Cache.Persist.Path, cacheboltdb.DatabaseFileName)
 					if err := os.Remove(dbFile); err != nil {
 						c.UI.Error(fmt.Sprintf("failed to remove persistent storage file %s: %s", dbFile, err))
-						if config.Cache.Persist.ExitOnErr {
+						if c.agentConfig.Cache.Persist.ExitOnErr {
 							return 1
 						}
 					}
@@ -669,7 +626,7 @@ func (c *AgentCommand) Run(args []string) int {
 					return 1
 				}
 				ps, err := cacheboltdb.NewBoltStorage(&cacheboltdb.BoltStorageConfig{
-					Path:    config.Cache.Persist.Path,
+					Path:    c.agentConfig.Cache.Persist.Path,
 					Logger:  cacheLogger.Named("cacheboltdb"),
 					Wrapper: km.Wrapper(),
 					AAD:     aad,
@@ -678,7 +635,7 @@ func (c *AgentCommand) Run(args []string) int {
 					c.UI.Error(fmt.Sprintf("Error creating persistent cache: %v", err))
 					return 1
 				}
-				cacheLogger.Info("configured persistent storage", "path", config.Cache.Persist.Path)
+				cacheLogger.Info("configured persistent storage", "path", c.agentConfig.Cache.Persist.Path)
 
 				// Stash the key material in bolt
 				token, err := km.RetrievalToken(ctx)
@@ -697,20 +654,25 @@ func (c *AgentCommand) Run(args []string) int {
 		}
 	}
 
-	var listeners []net.Listener
+	// TODO: PW: Here is the stuff..
+	err = c.handleListenersSetup()
+	if err != nil {
+		c.UI.Error(flattenErrors(err).Error())
+		return 1
+	}
 
 	// If there are templates, add an in-process listener
-	if len(config.Templates) > 0 {
-		config.Listeners = append(config.Listeners, &configutil.Listener{Type: listenerutil.BufConnType})
+	if len(c.agentConfig.Templates) > 0 {
+		c.agentConfig.Listeners = append(c.agentConfig.Listeners, &configutil.Listener{Type: listenerutil.BufConnType})
 	}
-	for i, lnConfig := range config.Listeners {
+	for i, lnConfig := range c.agentConfig.Listeners {
 		var ln net.Listener
 		var tlsConf *tls.Config
 
 		if lnConfig.Type == listenerutil.BufConnType {
 			inProcListener := bufconn.Listen(1024 * 1024)
-			if config.Cache != nil {
-				config.Cache.InProcDialer = listenerutil.NewBufConnWrapper(inProcListener)
+			if c.agentConfig.Cache != nil {
+				c.agentConfig.Cache.InProcDialer = listenerutil.NewBufConnWrapper(inProcListener)
 			}
 			ln = inProcListener
 		} else {
@@ -721,12 +683,12 @@ func (c *AgentCommand) Run(args []string) int {
 			}
 		}
 
-		listeners = append(listeners, ln)
+		c.listeners = append(c.listeners, ln)
 
 		proxyVaultToken := true
 		var inmemSink sink.Sink
-		if config.APIProxy != nil {
-			if config.APIProxy.UseAutoAuthToken {
+		if c.agentConfig.APIProxy != nil {
+			if c.agentConfig.APIProxy.UseAutoAuthToken {
 				apiProxyLogger.Debug("auto-auth token is allowed to be used; configuring inmem sink")
 				inmemSink, err = inmem.New(&sink.SinkConfig{
 					Logger: apiProxyLogger,
@@ -740,7 +702,7 @@ func (c *AgentCommand) Run(args []string) int {
 					Sink:   inmemSink,
 				})
 			}
-			proxyVaultToken = !config.APIProxy.ForceAutoAuthToken
+			proxyVaultToken = !c.agentConfig.APIProxy.ForceAutoAuthToken
 		}
 
 		muxHandler := cache.ProxyHandler(ctx, apiProxyLogger, apiProxy, inmemSink, proxyVaultToken)
@@ -770,9 +732,9 @@ func (c *AgentCommand) Run(args []string) int {
 			scheme = "unix://"
 		}
 
+		// TODO: PW: can these be merged into the other map (returned)?
 		infoKey := fmt.Sprintf("api address %d", i+1)
-		info[infoKey] = scheme + ln.Addr().String()
-		infoKeys = append(infoKeys, infoKey)
+		c.serverInfo.entries[infoKey] = scheme + ln.Addr().String()
 
 		server := &http.Server{
 			Addr:              ln.Addr().String(),
@@ -789,9 +751,7 @@ func (c *AgentCommand) Run(args []string) int {
 
 	// Ensure that listeners are closed at all the exits
 	listenerCloseFunc := func() {
-		for _, ln := range listeners {
-			ln.Close()
-		}
+		c.handleListenerCleanup()
 	}
 	defer c.cleanupGuard.Do(listenerCloseFunc)
 
@@ -800,11 +760,20 @@ func (c *AgentCommand) Run(args []string) int {
 		close(c.startedCh)
 	}
 
-	// Listen for signals
-	// TODO: implement support for SIGHUP reloading of configuration
-	// signal.Notify(c.signalCh)
-
 	var g run.Group
+
+	// Add handling for config reload
+	g.Add(func() error {
+		for {
+			select {
+			case <-c.SighupCh:
+				c.UI.Output("==> Vault Agent reload triggered")
+				// TODO: PW: Do we need some kind of channel passed in to signal when it's all done?
+				// TODO: PW: could use length of: reloadFuncs for buffer size since we'd expect them all to reload
+				c.handleConfigReload()
+			}
+		}
+	}, func(error) {})
 
 	// This run group watches for signal termination
 	g.Add(func() error {
@@ -831,7 +800,7 @@ func (c *AgentCommand) Run(args []string) int {
 
 	// Start auto-auth and sink servers
 	if method != nil {
-		enableTokenCh := len(config.Templates) > 0
+		enableTokenCh := len(c.agentConfig.Templates) > 0
 
 		// Auth Handler is going to set its own retry values, so we want to
 		// work on a copy of the client to not affect other subsystems.
@@ -841,39 +810,39 @@ func (c *AgentCommand) Run(args []string) int {
 			return 1
 		}
 
-		if config.DisableIdleConnsAutoAuth {
+		if c.agentConfig.DisableIdleConnsAutoAuth {
 			ahClient.SetMaxIdleConnections(-1)
 		}
 
-		if config.DisableKeepAlivesAutoAuth {
+		if c.agentConfig.DisableKeepAlivesAutoAuth {
 			ahClient.SetDisableKeepAlives(true)
 		}
 
 		ah := auth.NewAuthHandler(&auth.AuthHandlerConfig{
 			Logger:                       c.logger.Named("auth.handler"),
 			Client:                       ahClient,
-			WrapTTL:                      config.AutoAuth.Method.WrapTTL,
-			MinBackoff:                   config.AutoAuth.Method.MinBackoff,
-			MaxBackoff:                   config.AutoAuth.Method.MaxBackoff,
-			EnableReauthOnNewCredentials: config.AutoAuth.EnableReauthOnNewCredentials,
+			WrapTTL:                      c.agentConfig.AutoAuth.Method.WrapTTL,
+			MinBackoff:                   c.agentConfig.AutoAuth.Method.MinBackoff,
+			MaxBackoff:                   c.agentConfig.AutoAuth.Method.MaxBackoff,
+			EnableReauthOnNewCredentials: c.agentConfig.AutoAuth.EnableReauthOnNewCredentials,
 			EnableTemplateTokenCh:        enableTokenCh,
 			Token:                        previousToken,
-			ExitOnError:                  config.AutoAuth.Method.ExitOnError,
+			ExitOnError:                  c.agentConfig.AutoAuth.Method.ExitOnError,
 		})
 
 		ss := sink.NewSinkServer(&sink.SinkServerConfig{
 			Logger:        c.logger.Named("sink.server"),
 			Client:        ahClient,
-			ExitAfterAuth: config.ExitAfterAuth,
+			ExitAfterAuth: c.agentConfig.ExitAfterAuth,
 		})
 
 		ts := template.NewServer(&template.ServerConfig{
 			Logger:        c.logger.Named("template.server"),
-			LogLevel:      logLevel,
+			LogLevel:      c.logger.GetLevel(),
 			LogWriter:     c.logWriter,
-			AgentConfig:   config,
+			AgentConfig:   c.agentConfig,
 			Namespace:     templateNamespace,
-			ExitAfterAuth: config.ExitAfterAuth,
+			ExitAfterAuth: c.agentConfig.ExitAfterAuth,
 		})
 
 		g.Add(func() error {
@@ -904,7 +873,7 @@ func (c *AgentCommand) Run(args []string) int {
 			}()
 
 			// Wait until templates are rendered
-			if len(config.Templates) > 0 {
+			if len(c.agentConfig.Templates) > 0 {
 				<-ts.DoneCh
 			}
 
@@ -919,7 +888,7 @@ func (c *AgentCommand) Run(args []string) int {
 		})
 
 		g.Add(func() error {
-			return ts.Run(ctx, ah.TemplateTokenCh, config.Templates)
+			return ts.Run(ctx, ah.TemplateTokenCh, c.agentConfig.Templates)
 		}, func(error) {
 			// Let the lease cache know this is a shutdown; no need to evict
 			// everything
@@ -933,23 +902,13 @@ func (c *AgentCommand) Run(args []string) int {
 	}
 
 	// Server configuration output
-	padding := 24
-	sort.Strings(infoKeys)
-	c.UI.Output("==> Vault agent configuration:\n")
-	for _, k := range infoKeys {
-		c.UI.Output(fmt.Sprintf(
-			"%s%s: %s",
-			strings.Repeat(" ", padding-len(k)),
-			strings.Title(k),
-			info[k]))
-	}
-	c.UI.Output("")
+	c.outputServerConfiguration(c.serverInfo)
 
 	// Release the log gate.
 	c.logGate.Flush()
 
 	// Write out the PID to the file now that server has successfully started
-	if err := c.storePidFile(config.PidFile); err != nil {
+	if err := c.storePidFile(c.agentConfig.PidFile); err != nil {
 		c.UI.Error(fmt.Sprintf("Error storing PID: %s", err))
 		return 1
 	}
@@ -958,7 +917,7 @@ func (c *AgentCommand) Run(args []string) int {
 	c.notifySystemd(systemd.SdNotifyReady)
 
 	defer func() {
-		if err := c.removePidFile(config.PidFile); err != nil {
+		if err := c.removePidFile(c.agentConfig.PidFile); err != nil {
 			c.UI.Error(fmt.Sprintf("Error deleting the PID file: %s", err))
 		}
 	}()
@@ -972,68 +931,148 @@ func (c *AgentCommand) Run(args []string) int {
 	return 0
 }
 
+func (c *AgentCommand) outputServerConfiguration(info *serverInformation) {
+	padding := 24
+	infoKeys := make([]string, 0, len(info.entries))
+	for k := range info.entries {
+		infoKeys = append(infoKeys, k)
+	}
+	sort.Strings(infoKeys)
+	c.UI.Output("==> Vault agent configuration:\n")
+	titleCase := cases.Title(language.AmericanEnglish)
+	for _, k := range infoKeys {
+		c.UI.Output(fmt.Sprintf(
+			"%s%s: %s",
+			strings.Repeat(" ", padding-len(k)),
+			titleCase.String(k),
+			info.entries[k]))
+	}
+	c.UI.Output("")
+}
+
 // updateConfig ensures that the config object accurately reflects the desired
 // settings as configured by the user. It applies the relevant config setting based
 // on the precedence (env var overrides file config, cli overrides env var).
 // It mutates the config object supplied.
-func (c *AgentCommand) updateConfig(f *FlagSets, config *agentConfig.Config) {
-	f.updateLogConfig(config.SharedConfig)
+func (c *AgentCommand) updateConfig() error {
+	if c.flagSets == nil {
+		return fmt.Errorf("unable to update config, no flagsets configured")
+	}
+	if c.agentConfig == nil {
+		return fmt.Errorf("unable to update config, no file config configured")
+	}
 
-	f.Visit(func(fl *flag.Flag) {
+	c.flagSets.updateLogConfig(c.agentConfig.SharedConfig)
+
+	c.flagSets.Visit(func(fl *flag.Flag) {
 		if fl.Name == flagNameAgentExitAfterAuth {
-			config.ExitAfterAuth = c.flagExitAfterAuth
+			c.agentConfig.ExitAfterAuth = c.flagExitAfterAuth
 		}
 	})
 
-	c.setStringFlag(f, config.Vault.Address, &StringVar{
+	c.setStringFlag(c.flagSets, c.agentConfig.Vault.Address, &StringVar{
 		Name:    flagNameAddress,
 		Target:  &c.flagAddress,
 		Default: "https://127.0.0.1:8200",
 		EnvVar:  api.EnvVaultAddress,
 	})
-	config.Vault.Address = c.flagAddress
-	c.setStringFlag(f, config.Vault.CACert, &StringVar{
+	c.agentConfig.Vault.Address = c.flagAddress
+	c.setStringFlag(c.flagSets, c.agentConfig.Vault.CACert, &StringVar{
 		Name:    flagNameCACert,
 		Target:  &c.flagCACert,
 		Default: "",
 		EnvVar:  api.EnvVaultCACert,
 	})
-	config.Vault.CACert = c.flagCACert
-	c.setStringFlag(f, config.Vault.CAPath, &StringVar{
+	c.agentConfig.Vault.CACert = c.flagCACert
+	c.setStringFlag(c.flagSets, c.agentConfig.Vault.CAPath, &StringVar{
 		Name:    flagNameCAPath,
 		Target:  &c.flagCAPath,
 		Default: "",
 		EnvVar:  api.EnvVaultCAPath,
 	})
-	config.Vault.CAPath = c.flagCAPath
-	c.setStringFlag(f, config.Vault.ClientCert, &StringVar{
+	c.agentConfig.Vault.CAPath = c.flagCAPath
+	c.setStringFlag(c.flagSets, c.agentConfig.Vault.ClientCert, &StringVar{
 		Name:    flagNameClientCert,
 		Target:  &c.flagClientCert,
 		Default: "",
 		EnvVar:  api.EnvVaultClientCert,
 	})
-	config.Vault.ClientCert = c.flagClientCert
-	c.setStringFlag(f, config.Vault.ClientKey, &StringVar{
+	c.agentConfig.Vault.ClientCert = c.flagClientCert
+	c.setStringFlag(c.flagSets, c.agentConfig.Vault.ClientKey, &StringVar{
 		Name:    flagNameClientKey,
 		Target:  &c.flagClientKey,
 		Default: "",
 		EnvVar:  api.EnvVaultClientKey,
 	})
-	config.Vault.ClientKey = c.flagClientKey
-	c.setBoolFlag(f, config.Vault.TLSSkipVerify, &BoolVar{
+	c.agentConfig.Vault.ClientKey = c.flagClientKey
+	c.setBoolFlag(c.flagSets, c.agentConfig.Vault.TLSSkipVerify, &BoolVar{
 		Name:    flagNameTLSSkipVerify,
 		Target:  &c.flagTLSSkipVerify,
 		Default: false,
 		EnvVar:  api.EnvVaultSkipVerify,
 	})
-	config.Vault.TLSSkipVerify = c.flagTLSSkipVerify
-	c.setStringFlag(f, config.Vault.TLSServerName, &StringVar{
+	c.agentConfig.Vault.TLSSkipVerify = c.flagTLSSkipVerify
+	c.setStringFlag(c.flagSets, c.agentConfig.Vault.TLSServerName, &StringVar{
 		Name:    flagTLSServerName,
 		Target:  &c.flagTLSServerName,
 		Default: "",
 		EnvVar:  api.EnvVaultTLSServerName,
 	})
-	config.Vault.TLSServerName = c.flagTLSServerName
+	c.agentConfig.Vault.TLSServerName = c.flagTLSServerName
+
+	return nil
+}
+
+func (c *AgentCommand) handleReloadLogLevel() {
+	// TODO: PW: ... reload log level
+}
+
+func (c *AgentCommand) handleReloadListeners() (*serverInformation, error) {
+	// TODO: PW: ... reload listeners
+
+	var errors error
+
+	// TODO: PW: Close the existing listeners...
+	// TODO: PW: Parse and create new listeners...
+
+	// close the old listeners
+	for _, ln := range c.listeners {
+		err := ln.Close()
+		if err != nil {
+			errors = multierror.Append(errors, err)
+		}
+	}
+
+	if errors != nil {
+		// TODO: Errors closing the existing listeners.
+	}
+
+	// open the newly configured ones
+	return nil, nil
+}
+
+func (c *AgentCommand) handleReloadTls() {
+	// TODO: PW: ... reload TLS/certs
+	// TODO: PW: better name? handleReloadCerts ?
+}
+
+func (c *AgentCommand) handleConfigReload() {
+	// Let's just do one reload at a time
+	c.reloadFuncsLock.Lock()
+	defer c.reloadFuncsLock.Unlock()
+
+	// Notify systemd that Agent is reloading (and then has reloaded)
+	c.notifySystemd(systemd.SdNotifyReloading)
+	defer c.notifySystemd(systemd.SdNotifyReady)
+
+	// TODO: PW: Reload the supported 'reloadable' parts of config.
+	// Load the config file
+	// Merge the new config file with the existing config to 'update' it
+	// Now we need to clean up or reset:
+	// LOG LEVEL
+	// LISTENERS
+	// TLS CONFIG
+	// ... do we need some kind of errgroup/waitgroup to task.whenall the things?
 }
 
 // verifyRequestHeader wraps an http.Handler inside a Handler that checks for
@@ -1209,4 +1248,316 @@ func (c *AgentCommand) handleQuit(enabled bool) http.Handler {
 		c.logger.Debug("received quit request")
 		close(c.ShutdownCh)
 	})
+}
+
+// newLogConfig parses values stored in the AgentConfig to produce a LogConfig
+// which can be used to configure a logger. If there are problems parsing values
+// errors will be returned for all issues as a multierror.
+func newLogConfig(config *agentConfig.Config) (*logging.LogConfig, error) {
+	var errors error
+
+	// Parse all the log related config
+	logLevel, err := logging.ParseLogLevel(config.LogLevel)
+	if err != nil {
+		errors = multierror.Append(errors, err)
+	}
+
+	logFormat, err := logging.ParseLogFormat(config.LogFormat)
+	if err != nil {
+		errors = multierror.Append(errors, err)
+	}
+
+	logRotateDuration, err := parseutil.ParseDurationSecond(config.LogRotateDuration)
+	if err != nil {
+		errors = multierror.Append(errors, err)
+	}
+
+	logRotateBytes, err := parseutil.SafeParseInt(config.LogRotateBytes)
+	if err != nil {
+		errors = multierror.Append(errors, err)
+	}
+
+	logRotateMaxFiles, err := parseutil.SafeParseInt(config.LogRotateMaxFiles)
+	if err != nil {
+		errors = multierror.Append(errors, err)
+	}
+
+	if errors != nil {
+		return nil, errors
+	}
+
+	logCfg := &logging.LogConfig{
+		Name:              "vault-agent",
+		LogLevel:          logLevel,
+		LogFormat:         logFormat,
+		LogFilePath:       config.LogFile,
+		LogRotateDuration: logRotateDuration,
+		LogRotateBytes:    logRotateBytes,
+		LogRotateMaxFiles: logRotateMaxFiles,
+	}
+
+	return logCfg, nil
+}
+
+func (c *AgentCommand) updateLogLevel(logCfg *logging.LogConfig) error {
+	if c.logger == nil {
+		return fmt.Errorf("cannot update log level, no logger configured")
+	}
+
+	c.logger.SetLevel(logCfg.LogLevel)
+	return nil
+}
+
+// handleFlagSetsSetup handles the parsing of the command line args and assignment of them
+// to both the flagsets but also the flagsets to be stored against the AgentCommand struct.
+func (c *AgentCommand) handleFlagSetsSetup(args []string) error {
+	f := c.Flags()
+
+	if err := f.Parse(args); err != nil {
+		return err
+	}
+
+	c.flagSets = f
+	return nil
+}
+
+// handleLogSetup handles parsing loaded file config into log config, it sets up and
+// assigns the logger to the AgentCommand struct.
+func (c *AgentCommand) handleLogSetup() error {
+	// Sanity check things we need to set up logs.
+	if c.agentConfig == nil {
+		return fmt.Errorf("cannot configure logging, agent config not yet parsed")
+	}
+
+	// Create a logger.
+	// We wrap it in a gated writer so that it doesn't start logging too early.
+	if c.logGate == nil {
+		c.logGate = gatedwriter.NewWriter(os.Stderr)
+	}
+	if c.logWriter == nil {
+		c.logWriter = c.logGate
+	}
+
+	if c.logFlags.flagCombineLogs {
+		c.logWriter = os.Stdout
+	}
+
+	logCfg, err := newLogConfig(c.agentConfig)
+	if err != nil {
+		return err
+	}
+
+	logger, err := logging.Setup(logCfg, c.logWriter)
+	if err != nil {
+		return err
+	}
+
+	c.logger = logger
+	return nil
+}
+
+// handleListenerCleanup attemps to close all registered listeners
+// any errors from closing are returned to the caller in a multierror.
+func (c *AgentCommand) handleListenerCleanup() error {
+	if c.listeners == nil {
+		return nil
+	}
+
+	var errors error
+	// TODO: PW: Should we bother tracking ones that failed to close?
+	// or just blast them at the end?? feels like extra complication
+	// var badListeners []net.Listener
+
+	// Try and close any existing listeners before configuring
+	for _, ln := range c.listeners {
+		err := ln.Close()
+		if err != nil {
+			errors = multierror.Append(errors, err)
+			// badListeners = append(badListeners, ln)
+		}
+	}
+
+	if errors != nil {
+		// Leave the bad listeners in case of a retry??
+		// c.listeners = badListeners
+		return errors
+	}
+
+	c.listeners = nil
+	return nil
+}
+
+func (c *AgentCommand) handleListenersSetup(ctx context.Context, leaseCache *cache.LeaseCache, apiProxy *cache.Proxier) error {
+	// Sanity check
+	if c.agentConfig == nil {
+		return fmt.Errorf("cannot configure listeners, agent config not parsed")
+	}
+
+	if c.agentConfig.Listeners == nil {
+		return fmt.Errorf("cannot configure listeners, no listeners parsed from config")
+	}
+
+	var errors error
+
+	// TODO: PW: We might need to close/remove/etc the other stuff that's wired to a listener, sink.. server info will
+	// have to be blasted and reloaded from scratch as it's unconnected at this point
+
+	// Try and close any existing listeners before configuring
+	errors = c.handleListenerCleanup()
+	if errors != nil {
+		return errors
+	}
+
+	// If there are templates, add an in-process listener as part of config
+	if len(c.agentConfig.Templates) > 0 {
+		c.agentConfig.Listeners = append(c.agentConfig.Listeners, &configutil.Listener{Type: listenerutil.BufConnType})
+	}
+
+	for i, lnConfig := range c.agentConfig.Listeners {
+		var ln net.Listener
+		var tlsConf *tls.Config
+		var err error
+
+		// TODO: PW: I don't understand what the intention of this is, but weirdly it fiddled with:
+		// c.agentConfig.Cache.InProcDialer which feels odd, we're changing config we parsed from the user
+		// https://github.com/hashicorp/vault/blob/main/command/agent.go#L713
+		if lnConfig.Type == listenerutil.BufConnType {
+			inProcListener := bufconn.Listen(1024 * 1024)
+			if c.agentConfig.Cache != nil {
+				c.agentConfig.Cache.InProcDialer = listenerutil.NewBufConnWrapper(inProcListener)
+			}
+			ln = inProcListener
+		} else {
+			ln, tlsConf, err = cache.StartListener(lnConfig)
+			if err != nil {
+				return err
+			}
+		}
+
+		// TODO: why add the listener at this point, there's loads of stuff it is used for
+		// before we should 'add' it to the list of registered listeners.
+		// the docs say a listener is: How Vault listens for API requests.
+		// that sounds like a mistake? aren't we saying: how Vault Agent listens for API requests?
+		c.listeners = append(c.listeners, ln)
+
+		// listeners can be configured with proxy related settings
+		// https://developer.hashicorp.com/vault/docs/configuration/listener/tcp#proxy_protocol_behavior
+		// so the handler used by the mux (router) needs to be a proxy one.
+
+		proxyCfg := &cache.ProxyHandlerConfig{
+			Logger:  nil,
+			Proxier: apiProxy,
+			// Sink:                  &inmemSink,
+			ShouldProxyVaultToken: true,
+		}
+
+		// var inmemSink sink.Sink
+		if c.agentConfig.APIProxy != nil {
+			proxyCfg.ShouldProxyVaultToken = !c.agentConfig.APIProxy.ForceAutoAuthToken
+		}
+
+		if c.agentConfig.APIProxy != nil && c.agentConfig.APIProxy.UseAutoAuthToken {
+			proxyCfg.Logger.Debug("auto-auth token is allowed to be used; configuring inmem sink")
+
+			s, err := inmem.New(&sink.SinkConfig{
+				Logger: proxyCfg.Logger,
+			}, leaseCache)
+			if err != nil {
+				return err
+			}
+			proxyCfg.Sink = s
+
+			// TODO: PW: We're adding to this, how is it tracked in relation to the handler in case we reload??
+			// we'd need to remove this sink from the slice, as the length of the slice is tracked in the sink server
+			// to see when it needs to ignore stuff...
+			sinks = append(sinks, &sink.SinkConfig{
+				Logger: proxyCfg.Logger,
+				Sink:   proxyCfg.Sink,
+			})
+		}
+
+		muxHandler := cache.ProxyHandler2(ctx, proxyCfg)
+
+		// Basically this little if then wrap the func thing is just adding a
+		// check for 'X-Vault-Request' on the req....
+
+		// Parse 'require_request_header' listener config option, and wrap
+		// the request handler if necessary
+		if lnConfig.RequireRequestHeader && ("metrics_only" != lnConfig.Role) {
+			muxHandler = verifyRequestHeader(muxHandler)
+		}
+
+		// Create a muxer and add paths relevant for the lease cache layer
+		mux := http.NewServeMux()
+		quitEnabled := lnConfig.AgentAPI != nil && lnConfig.AgentAPI.EnableQuit
+
+		mux.Handle(consts.AgentPathMetrics, c.handleMetrics())
+		if "metrics_only" != lnConfig.Role {
+			mux.Handle(consts.AgentPathCacheClear, leaseCache.HandleCacheClear(ctx))
+			mux.Handle(consts.AgentPathQuit, c.handleQuit(quitEnabled))
+			mux.Handle("/", muxHandler)
+		}
+
+		scheme := "https://"
+		if tlsConf == nil {
+			scheme = "http://"
+		}
+		if ln.Addr().Network() == "unix" {
+			scheme = "unix://"
+		}
+
+		// TODO: PW: can these be merged into the other map (returned)?
+		infoKey := fmt.Sprintf("api address %d", i+1)
+		c.serverInfo.entries[infoKey] = scheme + ln.Addr().String()
+
+		server := &http.Server{
+			Addr:              ln.Addr().String(),
+			TLSConfig:         tlsConf,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			ReadTimeout:       30 * time.Second,
+			IdleTimeout:       5 * time.Minute,
+			ErrorLog:          apiProxyLogger.StandardLogger(nil),
+		}
+
+		go server.Serve(ln)
+	}
+}
+
+func (c *AgentCommand) getMuxFoo() (*http.ServeMux, error) {
+}
+
+func (c *AgentCommand) handleServerInfoSetup() error {
+	// Sanity check
+	if c.logger == nil {
+		return fmt.Errorf("cannot configure server information, no logger configured")
+	}
+
+	c.serverInfo = NewServerInformation()
+	c.serverInfo.entries["log level"] = c.logger.GetLevel().String()
+
+	if version.CgoEnabled {
+		c.serverInfo.entries["cgo"] = "enabled"
+	} else {
+		c.serverInfo.entries["cgo"] = "disabled"
+	}
+
+	verInfo := version.GetVersion()
+	c.serverInfo.entries["version"] = verInfo.FullVersionNumber(false)
+
+	if verInfo.Revision != "" {
+		c.serverInfo.entries["version sha"] = strings.Trim(verInfo.Revision, "'")
+	}
+
+	return nil
+}
+
+// flattenErrors will accept an error which may or may not be a multierror, it
+// will flatten multierrors when present and return a single error .
+func flattenErrors(errors error) error {
+	if merr, ok := errors.(*multierror.Error); ok {
+		return multierror.Flatten(merr)
+	} else {
+		return errors
+	}
 }

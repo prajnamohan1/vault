@@ -20,6 +20,87 @@ import (
 	"github.com/hashicorp/vault/sdk/logical"
 )
 
+type ProxyHandlerConfig struct {
+	Logger                hclog.Logger
+	Proxier               *Proxier
+	Sink                  sink.Sink
+	ShouldProxyVaultToken bool
+}
+
+func ProxyHandler2(ctx context.Context, config *ProxyHandlerConfig) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// TODO: PW: Check logger != nil
+		config.Logger.Info("received request", "method", r.Method, "path", r.URL.Path)
+
+		if !config.ShouldProxyVaultToken {
+			r.Header.Del(consts.AuthHeaderName)
+		}
+
+		token := r.Header.Get(consts.AuthHeaderName)
+
+		if token == "" && config.Sink != nil {
+			config.Logger.Debug("using auto auth token", "method", r.Method, "path", r.URL.Path)
+			token = config.Sink.(sink.SinkReader).Token()
+		}
+
+		// Parse and reset body.
+		reqBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			config.Logger.Error("failed to read request body")
+			logical.RespondError(w, http.StatusInternalServerError, errors.New("failed to read request body"))
+			return
+		}
+		if r.Body != nil {
+			r.Body.Close()
+		}
+		r.Body = io.NopCloser(bytes.NewReader(reqBody))
+		req := &SendRequest{
+			Token:       token,
+			Request:     r,
+			RequestBody: reqBody,
+		}
+
+		// TODO: PW: proxier nil? sholud probably check everything we need at the top
+		resp, err := config.Proxier.Send(ctx, req)
+		if err != nil {
+			// If this is an api.Response error, don't wrap the response.
+			if resp != nil && resp.Response.Error() != nil {
+				copyHeader(w.Header(), resp.Response.Header)
+				w.WriteHeader(resp.Response.StatusCode)
+				io.Copy(w, resp.Response.Body)
+				metrics.IncrCounter([]string{"agent", "proxy", "client_error"}, 1)
+			} else {
+				metrics.IncrCounter([]string{"agent", "proxy", "error"}, 1)
+				logical.RespondError(w, http.StatusInternalServerError, fmt.Errorf("failed to get the response: %w", err))
+			}
+			return
+		}
+
+		err = sanitizeAutoAuthTokenResponse(ctx, config.Logger, config.Sink, req, resp)
+		if err != nil {
+			logical.RespondError(w, http.StatusInternalServerError, fmt.Errorf("failed to process token lookup response: %w", err))
+			return
+		}
+
+		defer resp.Response.Body.Close()
+
+		metrics.IncrCounter([]string{"agent", "proxy", "success"}, 1)
+		if resp.CacheMeta != nil {
+			if resp.CacheMeta.Hit {
+				metrics.IncrCounter([]string{"agent", "cache", "hit"}, 1)
+			} else {
+				metrics.IncrCounter([]string{"agent", "cache", "miss"}, 1)
+			}
+		}
+
+		// Set headers
+		setHeaders(w, resp)
+
+		// Set response body
+		io.Copy(w, resp.Response.Body)
+	})
+}
+
 func ProxyHandler(ctx context.Context, logger hclog.Logger, proxier Proxier, inmemSink sink.Sink, proxyVaultToken bool) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		logger.Info("received request", "method", r.Method, "path", r.URL.Path)

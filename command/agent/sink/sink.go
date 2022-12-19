@@ -105,6 +105,8 @@ func (ss *SinkServer) Run(ctx context.Context, incoming chan string, sinks []*Si
 		sink  *SinkConfig
 		token string
 	}
+
+	// TODO: PW: Could we pass in a chan that supplies new sinks to deal with?
 	sinkCh := make(chan sinkToken, len(sinks))
 	for {
 		select {
