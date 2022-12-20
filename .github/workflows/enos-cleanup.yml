@@ -37,8 +37,9 @@ jobs:
       - uses: actions/checkout@v3
       - name: Configure
         run: |
-          ls -la /tmp/vault
-          cp -rp ${{github.workspace}}/enos/ci/aws-nuke.yml .
+          mount
+          ls /home/runner/work/vault
+          cp -rp /__w/vault/vault/enos/ci/aws-nuke.yml .
           sed -i "s/000000000000/${{ needs.setup.outputs.acctnum }}/g" aws-nuke.yml
           sed -i "s/TIME_LIMIT/${TIME_LIMIT}/g" aws-nuke.yml
       # We don't care if cleanup succeeds or fails, because dependencies be dependenceies,
