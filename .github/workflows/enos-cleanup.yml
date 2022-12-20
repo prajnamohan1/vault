@@ -27,16 +27,14 @@ jobs:
       options:
          --user root
       env:
-        AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
-        AWS_SESSION_TOKEN: ${{ env.AWS_SESSION_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID_CI }}
+        AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY_CI }}
         TIME_LIMIT: "72h"
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v3
       - name: Configure
         run: |
-          ls /github/work
           cp -rp /__w/vault/vault/enos/ci/aws-nuke.yml .
           sed -i "s/000000000000/${{ needs.setup.outputs.acctnum }}/g" aws-nuke.yml
           sed -i "s/TIME_LIMIT/${TIME_LIMIT}/g" aws-nuke.yml
@@ -52,9 +50,8 @@ jobs:
     container:
       image: jantman/awslimitchecker
       env:
-        AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
-        AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
-        AWS_SESSION_TOKEN: ${{ env.AWS_SESSION_TOKEN }}
+        AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID_CI }}
+        AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY_CI }}
     strategy:
       matrix:
         region: ${{ fromJSON(needs.setup.outputs.regions) }}
