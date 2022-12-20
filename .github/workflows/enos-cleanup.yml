@@ -14,6 +14,9 @@ jobs:
     outputs:
       regions: ${{steps.get_regions.outputs.regions}}
       acctnum: ${{steps.get_acct.outputs.acctnum}}
+    env:
+        AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID_CI }}
+        AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY_CI }}
     steps:
       - id: get_regions
         run: echo "regions=$(aws ec2 describe-regions --region us-east-1 --output json --query 'Regions[].RegionName' | tr -d '\n ')" >> $GITHUB_OUTPUT
