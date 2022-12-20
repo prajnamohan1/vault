@@ -34,7 +34,7 @@ jobs:
     steps:
       - name: Configure
         run: |
-          ls -l /home/runner/work
+          ls -l /home/runner
           cp -rp ${{github.workspace}}/enos/ci/aws-nuke.yml .
           sed -i "s/000000000000/${{ needs.setup.outputs.acctnum }}/g" aws-nuke.yml
           sed -i "s/TIME_LIMIT/${TIME_LIMIT}/g" aws-nuke.yml
