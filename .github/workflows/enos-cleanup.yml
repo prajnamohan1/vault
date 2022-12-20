@@ -12,17 +12,15 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      regions: ${{steps.get_regions.outputs.regions}}
-      acctnum: ${{steps.get_acct.outputs.acctnum}}
+      regions: ${{steps.setup.outputs.regions}}
+      acctnum: ${{steps.setup.outputs.acctnum}}
     steps:
-      - id: set_env
+      - id: setup
         run: |
           export AWS_ACCESS_KEY_ID=${{ env.AWS_ACCESS_KEY_ID_CI }}
           export AWS_SECRET_ACCESS_KEY=${{ env.AWS_SECRET_ACCESS_KEY_CI }}
-      - id: get_regions
-        run: echo "regions=$(aws ec2 describe-regions --region us-east-1 --output json --query 'Regions[].RegionName' | tr -d '\n ')" >> $GITHUB_OUTPUT
-      - id: get_acct
-        run: echo "acctnum=$(aws sts get-caller-identity --output text --query 'Account')" >> $GITHUB_OUTPUT
+          echo "regions=$(aws ec2 describe-regions --region us-east-1 --output json --query 'Regions[].RegionName' | tr -d '\n ')" >> $GITHUB_OUTPUT
+          echo "acctnum=$(aws sts get-caller-identity --output text --query 'Account')" >> $GITHUB_OUTPUT
   aws-nuke:
     needs: setup
     runs-on: ubuntu-latest
