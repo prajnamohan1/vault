@@ -24,7 +24,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rebuy/aws-nuke
-      options: -v "/home/runnner/work/vault":"/tmp/vault"
+      options:
+         -v "/home/runnner/work/vault":"/tmp/vault"
+         --user root
       env:
         AWS_ACCESS_KEY_ID: ${{ env.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ env.AWS_SECRET_ACCESS_KEY }}
