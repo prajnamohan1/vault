@@ -38,7 +38,7 @@ jobs:
       - name: Configure
         run: |
           mount
-          ls /home/runner/work/vault
+          ls /github/home
           cp -rp /__w/vault/vault/enos/ci/aws-nuke.yml .
           sed -i "s/000000000000/${{ needs.setup.outputs.acctnum }}/g" aws-nuke.yml
           sed -i "s/TIME_LIMIT/${TIME_LIMIT}/g" aws-nuke.yml
