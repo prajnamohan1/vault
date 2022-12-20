@@ -91,6 +91,10 @@ type AgentCommand struct {
 	// sinks       []*sink.SinkConfig
 	serverInfo *serverInformation
 	listeners  []net.Listener
+	// TODO: PW: thinking about keeping these two separate until we need to monge them
+	// for the sink server Run
+	fileSinks  []*sink.SinkConfig
+	inmemSinks []*sink.SinkConfig // TODO: PW: some listeners have these (not nil)
 
 	// ....TODO: PW: add others..
 
@@ -248,6 +252,7 @@ func (c *AgentCommand) Run(args []string) int {
 		return 1
 	}
 
+	// Server info setup
 	if err := c.handleServerInfoSetup(); err != nil {
 		c.UI.Error(err.Error())
 		return 1
@@ -857,7 +862,25 @@ func (c *AgentCommand) Run(args []string) int {
 		})
 
 		g.Add(func() error {
-			err := ss.Run(ctx, ah.OutputCh, sinks)
+			// var isRunning bool
+
+			// // for select on reload chan?
+			// for {
+			// 	select {
+			// 	case <-reloadChan:
+			// 		// channel called for a reload, so we need to send that into the
+			// 		// sink server so it quits and then we re-inject the new sinks and
+			// 		// start it up again?
+			// 		// but how do we start it the first time and carry on?
+
+			// 		// .Run is like a blocking operation where only the context can cancel it :/
+			// 	}
+			// }
+
+			// TODO: PW: this needs to be accessible elsewhere so we can get out and create
+			// a new sink server to account for config changes to listeners
+			sinkServerQuit := make(chan struct{})
+			err := ss.Run(ctx, ah.OutputCh, sinkServerQuit, sinks)
 			c.logger.Info("sinks finished, exiting")
 
 			// Start goroutine to drain from ah.OutputCh from this point onward

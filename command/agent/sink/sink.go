@@ -69,7 +69,7 @@ func NewSinkServer(conf *SinkServerConfig) *SinkServer {
 
 // Run executes the server's run loop, which is responsible for reading
 // in new tokens and pushing them out to the various sinks.
-func (ss *SinkServer) Run(ctx context.Context, incoming chan string, sinks []*SinkConfig) error {
+func (ss *SinkServer) Run(ctx context.Context, incoming chan string, done chan struct{}, sinks []*SinkConfig) error {
 	latestToken := new(string)
 	writeSink := func(currSink *SinkConfig, currToken string) error {
 		if currToken != *latestToken {
@@ -106,13 +106,11 @@ func (ss *SinkServer) Run(ctx context.Context, incoming chan string, sinks []*Si
 		token string
 	}
 
-	// TODO: PW: Could we pass in a chan that supplies new sinks to deal with?
 	sinkCh := make(chan sinkToken, len(sinks))
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-
 		case token := <-incoming:
 			if len(sinks) > 0 {
 				if token != *latestToken {
@@ -165,6 +163,9 @@ func (ss *SinkServer) Run(ctx context.Context, incoming chan string, sinks []*Si
 					return nil
 				}
 			}
+		case <-done:
+			// Expected that this means we've been asked to quit, probably as part of a hot-reload.
+			return nil
 		}
 	}
 }
